@@ -1,0 +1,15 @@
+[Unit]
+Description=Feishu bot -> zcode2api gateway bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/feishu-bot
+EnvironmentFile=/opt/feishu-bot/.env
+ExecStart=/opt/feishu-bot/feishu-bot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

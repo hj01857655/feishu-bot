@@ -1,0 +1,11 @@
+# 凭据与本地配置，绝不入库
+.env
+*.local
+
+# 编译产物
+build/
+feishu-bot
+feishu-bot.exe
+
+# 任务临时文件
+feishu-task-*.txt
