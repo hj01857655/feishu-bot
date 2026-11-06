@@ -20,11 +20,14 @@ import (
 	"time"
 	"os/exec"
 
+	"unicode/utf8"
+
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 type Config struct {
@@ -205,7 +208,7 @@ func agentWorker() {
 	for t := range taskQueue {
 		log.Printf("[agent] 开始任务 chat=%s: %s", t.chatID, truncate(t.text, 80))
 		ans := runAgent(t.cfg, t.text)
-		log.Printf("[agent] 任务完成 chat=%s", t.chatID)
+		log.Printf("[agent] 任务完成 chat=%s 回复摘要: %s", t.chatID, truncate(strings.ReplaceAll(ans, "\n", " "), 120))
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		replyText(ctx, t.client, t.chatID, truncate(ans, 4000))
 		cancel()
@@ -219,30 +222,19 @@ func runAgent(cfg Config, prompt string) string {
 	if cfg.AgentCmd == "" || cfg.WorkDir == "" {
 		return "agent 模式未配置完整（AGENT_CMD / WORK_DIR）"
 	}
-	// 消息落临时文件，命令模板用 {file} 引用，绕开 Windows 命令行转义地狱
-	f, err := os.CreateTemp("", "feishu-task-*.txt")
-	if err != nil {
-		return "写任务临时文件失败: " + err.Error()
-	}
-	tmp := f.Name()
-	f.WriteString(prompt)
-	f.Close()
-	defer os.Remove(tmp)
-
-	cmdStr := strings.ReplaceAll(cfg.AgentCmd, "{file}", tmp)
+	// 消息从 stdin 管道喂给子进程，不落盘、不经 cmd 重定向
+	// （Go exec 会把引号转义成 \"，cmd 不认该转义，< "path" 重定向必报"语法不正确"）
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "cmd", "/c", cmdStr)
+	cmd := exec.CommandContext(ctx, "cmd", "/c", cfg.AgentCmd)
 	cmd.Dir = cfg.WorkDir
+	cmd.Stdin = strings.NewReader(prompt)
 	out, err := cmd.CombinedOutput()
 	elapsed := "（未超时）"
 	if ctx.Err() == context.DeadlineExceeded {
 		elapsed = "（已超时中止，输出为部分结果）"
 	}
-	if err != nil && len(out) == 0 {
-		return fmt.Sprintf("agent 执行失败: %v", err)
-	}
-	res := strings.TrimSpace(string(out))
+	res := normalizeOutput(out)
 	if res == "" {
 		if err != nil {
 			return fmt.Sprintf("agent 无输出，退出码异常: %v %s", err, elapsed)
@@ -250,6 +242,28 @@ func runAgent(cfg Config, prompt string) string {
 		return "agent 执行完成，无输出。" + elapsed
 	}
 	return res + "\n" + elapsed
+}
+
+// normalizeOutput 统一输出编码并清理杂质：
+// Windows 下 cmd/控制台程序输出 GBK（非法 UTF-8 字节序列），node 系 CLI 输出 UTF-8；
+// 先按 UTF-8 校验，非法则按 GBK 解码；再过滤 CLI 的环境警告行。
+func normalizeOutput(out []byte) string {
+	b := out
+	if !utf8.Valid(b) {
+		if dec, err := simplifiedchinese.GBK.NewDecoder().Bytes(b); err == nil {
+			b = dec
+		}
+	}
+	lines := strings.Split(string(b), "\n")
+	kept := lines[:0]
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if t == "" || strings.HasPrefix(t, "[claude-code:") {
+			continue
+		}
+		kept = append(kept, ln)
+	}
+	return strings.TrimSpace(strings.Join(kept, "\n"))
 }
 
 // ---------- 飞书消息 ----------
@@ -302,7 +316,11 @@ func main() {
 
 	client := lark.NewClient(cfg.AppID, cfg.AppSecret)
 
-	dispatcher := larkws.NewEventDispatcher("", "")
+	dispatcher := dispatcher.NewEventDispatcher("", "")
+	// 用户进入机器人聊天界面会推 bot_p2p_chat_entered_v1，注册空 handler 避免 not found 报错刷日志
+	dispatcher.OnP2ChatAccessEventBotP2pChatEnteredV1(func(ctx context.Context, event *larkim.P2ChatAccessEventBotP2pChatEnteredV1) error {
+		return nil
+	})
 	dispatcher.OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
 		defer func() {
 			if r := recover(); r != nil {

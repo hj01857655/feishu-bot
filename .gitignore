@@ -1,6 +1,7 @@
 # 凭据与本地配置，绝不入库
 .env
 *.local
+bot.log
 
 # 编译产物
 build/
